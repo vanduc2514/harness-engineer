@@ -11,9 +11,6 @@ import {
 import type { Session, SessionStore, StateStore } from './sessions.ts'
 import type { SessionUser } from '../shared/types.ts'
 
-export const GITHUB_AUTHORIZE_URL = 'https://github.com/login/oauth/authorize'
-export const GITHUB_TOKEN_URL = 'https://github.com/login/oauth/access_token'
-export const GITHUB_USER_URL = 'https://api.github.com/user'
 export const GITHUB_SCOPE = 'read:user'
 
 export type AuthErrorCode =
@@ -50,7 +47,7 @@ export function createAuthRouter(options: AuthRouterOptions): Router {
   }
 
   router.get('/github', (_req, res) => {
-    const url = new URL(GITHUB_AUTHORIZE_URL)
+    const url = new URL(config.github.authorizeUrl)
     url.searchParams.set('client_id', config.clientId)
     url.searchParams.set('redirect_uri', config.callbackUrl)
     url.searchParams.set('scope', GITHUB_SCOPE)
@@ -78,7 +75,7 @@ export function createAuthRouter(options: AuthRouterOptions): Router {
 
     try {
       const accessToken = await exchangeCodeForToken(config, code, fetchImpl)
-      const user = await fetchGitHubUser(accessToken, fetchImpl)
+      const user = await fetchGitHubUser(config, accessToken, fetchImpl)
       const session = sessions.create(user)
       res.cookie(
         SESSION_COOKIE,
@@ -128,7 +125,7 @@ async function exchangeCodeForToken(
   code: string,
   fetchImpl: typeof fetch,
 ): Promise<string> {
-  const response = await fetchImpl(GITHUB_TOKEN_URL, {
+  const response = await fetchImpl(config.github.tokenUrl, {
     method: 'POST',
     headers: { accept: 'application/json', 'content-type': 'application/json' },
     body: JSON.stringify({
@@ -159,10 +156,11 @@ async function exchangeCodeForToken(
 }
 
 async function fetchGitHubUser(
+  config: AppConfig,
   accessToken: string,
   fetchImpl: typeof fetch,
 ): Promise<SessionUser> {
-  const response = await fetchImpl(GITHUB_USER_URL, {
+  const response = await fetchImpl(config.github.userUrl, {
     headers: {
       accept: 'application/vnd.github+json',
       authorization: `Bearer ${accessToken}`,

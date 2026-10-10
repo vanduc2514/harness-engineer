@@ -3,9 +3,15 @@ import type { Server } from 'node:http'
 import type { AddressInfo } from 'node:net'
 import { afterEach, describe, expect, it } from 'vitest'
 import { createApp } from './app.ts'
-import { GITHUB_AUTHORIZE_URL, GITHUB_TOKEN_URL, GITHUB_USER_URL } from './auth.ts'
+import { GITHUB_ENDPOINTS } from './config.ts'
 import type { AppConfig } from './config.ts'
 import { SESSION_COOKIE, SessionStore, StateStore } from './sessions.ts'
+
+const {
+  authorizeUrl: GITHUB_AUTHORIZE_URL,
+  tokenUrl: GITHUB_TOKEN_URL,
+  userUrl: GITHUB_USER_URL,
+} = GITHUB_ENDPOINTS
 
 const ACCESS_TOKEN = 'gho_test_token'
 
@@ -23,6 +29,7 @@ const config: AppConfig = {
   callbackUrl: 'http://localhost:5173/api/auth/github/callback',
   port: 0,
   cookieSecure: false,
+  github: GITHUB_ENDPOINTS,
 }
 
 interface StubOptions {

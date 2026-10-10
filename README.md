@@ -47,8 +47,22 @@ value so the proxy target follows.
 | `mise run dev` | API and Vite dev server together |
 | `mise run lint` | Lint with oxlint |
 | `mise run test` | Backend tests with vitest |
+| `mise run e2e` | Browser test of the sign-in flow against a stub GitHub |
 | `mise run build` | Type-check and build the frontend |
 | `mise run verify` | lint + test + build in one pass |
+
+### Verifying sign in
+
+`mise run test` covers the API in isolation: the redirect it builds, the state check,
+the cookie, the profile response, and every failure path. `mise run e2e` drives a real
+browser through the whole flow - click the button, land back signed in, see the avatar,
+reload, sign out - against a local stub that speaks GitHub's three endpoints. GitHub
+will not authorise a headless browser, so the stub is what makes the browser test
+possible without a human clicking "Authorize"; the stub is wired in through
+`GITHUB_AUTHORIZE_URL`, `GITHUB_TOKEN_URL` and `GITHUB_USER_URL` (see `.env.example`).
+
+Signing in against real GitHub still needs one manual click, because consent is the
+whole point of the flow.
 
 ## Tooling
 
@@ -75,6 +89,7 @@ Skills install to `~/.copilot/installed-plugins/<marketplace>/<plugin>/skills/`.
 | --- | --- |
 | `src/` | Root app frontend: login screen and signed-in profile |
 | `server/` | Root app API: Express routes, OAuth flow, sessions, tests |
+| `e2e/` | Browser test that drives the sign-in flow against a stub GitHub |
 | `shared/` | Types shared by the API and the browser |
 | `notes/` | Findings, harness evaluations, decisions |
 | `experiments/` | Throwaway prototypes and spike code |

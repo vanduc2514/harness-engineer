@@ -8,6 +8,20 @@ export interface AppConfig {
   callbackUrl: string
   port: number
   cookieSecure: boolean
+  github: GitHubEndpoints
+}
+
+/** Real GitHub endpoints. Tests point these at a local stub instead. */
+export interface GitHubEndpoints {
+  authorizeUrl: string
+  tokenUrl: string
+  userUrl: string
+}
+
+export const GITHUB_ENDPOINTS: GitHubEndpoints = {
+  authorizeUrl: 'https://github.com/login/oauth/authorize',
+  tokenUrl: 'https://github.com/login/oauth/access_token',
+  userUrl: 'https://api.github.com/user',
 }
 
 export class ConfigError extends Error {
@@ -60,5 +74,10 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
       env.GITHUB_CALLBACK_URL?.trim() || `${appOrigin}/api/auth/github/callback`,
     port: Number(env.PORT ?? 3000),
     cookieSecure: env.COOKIE_SECURE?.trim() === 'true',
+    github: {
+      authorizeUrl: env.GITHUB_AUTHORIZE_URL?.trim() || GITHUB_ENDPOINTS.authorizeUrl,
+      tokenUrl: env.GITHUB_TOKEN_URL?.trim() || GITHUB_ENDPOINTS.tokenUrl,
+      userUrl: env.GITHUB_USER_URL?.trim() || GITHUB_ENDPOINTS.userUrl,
+    },
   }
 }

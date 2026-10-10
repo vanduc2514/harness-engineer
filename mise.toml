@@ -23,6 +23,10 @@ run = "npm run lint"
 description = "Run backend tests with vitest"
 run = "npm test"
 
+[tasks.e2e]
+description = "Run the browser test for the GitHub sign-in flow"
+run = "node e2e/login.mjs"
+
 [tasks.verify]
 description = "Run lint, tests, and build in sequence"
 depends = ["lint", "test", "build"]
