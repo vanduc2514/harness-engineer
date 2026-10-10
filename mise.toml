@@ -1,0 +1,28 @@
+# Toolchain for the root app. Run `mise install` after checkout, then use
+# `mise run <task>` for everything else.
+[tools]
+node = "22"
+
+[tasks.install]
+description = "Install npm dependencies"
+run = "npm install"
+
+[tasks.dev]
+description = "Run the API and the Vite dev server together"
+run = "npm run dev"
+
+[tasks.build]
+description = "Type-check and build the frontend"
+run = "npm run build"
+
+[tasks.lint]
+description = "Lint with oxlint"
+run = "npm run lint"
+
+[tasks.test]
+description = "Run backend tests with vitest"
+run = "npm test"
+
+[tasks.verify]
+description = "Run lint, tests, and build in sequence"
+depends = ["lint", "test", "build"]
