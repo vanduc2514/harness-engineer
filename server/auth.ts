@@ -1,14 +1,20 @@
 import { Router } from 'express'
 import type { Request, Response } from 'express'
 import { parseCookie } from 'cookie'
+import type { Cookies } from 'cookie'
 import type { AppConfig } from './config.ts'
 import {
   SESSION_COOKIE,
   SESSION_TTL_MS,
-  parseSessionCookie,
-  serializeSessionCookie,
+  STATE_COOKIE,
+  STATE_TTL_MS,
+  createSessionToken,
+  createState,
+  readSessionToken,
+  readState,
+  stateMatches,
 } from './sessions.ts'
-import type { Session, SessionStore, StateStore } from './sessions.ts'
+import type { Session } from './sessions.ts'
 import type { SessionUser } from '../shared/types.ts'
 
 export const GITHUB_SCOPE = 'read:user'
@@ -27,44 +33,59 @@ export class TokenExchangeError extends Error {
 
 export interface AuthRouterOptions {
   config: AppConfig
-  sessions: SessionStore
-  states: StateStore
+  /** Swap out `fetch` in tests so no real GitHub call is made. */
   fetchImpl?: typeof fetch
 }
 
 export function createAuthRouter(options: AuthRouterOptions): Router {
-  const { config, sessions, states } = options
+  const { config } = options
   const fetchImpl = options.fetchImpl ?? fetch
   const router = Router()
+
+  const baseCookie = {
+    httpOnly: true,
+    sameSite: 'lax',
+    secure: config.cookieSecure,
+    path: '/',
+  } as const
 
   const fail = (res: Response, code: AuthErrorCode) =>
     res.redirect(`/?authError=${code}`)
 
+  function cookies(req: Request): Cookies {
+    return parseCookie(req.headers.cookie ?? '')
+  }
+
   function readSession(req: Request): Session | null {
-    const cookies = parseCookie(req.headers.cookie ?? '')
-    const id = parseSessionCookie(cookies[SESSION_COOKIE], config.sessionSecret)
-    return id ? sessions.get(id) : null
+    return readSessionToken(cookies(req)[SESSION_COOKIE], config.sessionSecret)
   }
 
   router.get('/github', (_req, res) => {
+    const { state, token } = createState(config.sessionSecret)
+    res.cookie(STATE_COOKIE, token, { ...baseCookie, maxAge: STATE_TTL_MS })
+
     const url = new URL(config.github.authorizeUrl)
     url.searchParams.set('client_id', config.clientId)
     url.searchParams.set('redirect_uri', config.callbackUrl)
     url.searchParams.set('scope', GITHUB_SCOPE)
-    // Single-use and verified on the way back, which is what blocks login CSRF.
-    url.searchParams.set('state', states.issue())
+    url.searchParams.set('state', state)
     res.redirect(url.toString())
   })
 
   router.get('/github/callback', async (req, res) => {
-    const state = typeof req.query.state === 'string' ? req.query.state : undefined
+    const providedState =
+      typeof req.query.state === 'string' ? req.query.state : undefined
     const code = typeof req.query.code === 'string' ? req.query.code : undefined
+    const expectedState = readState(cookies(req)[STATE_COOKIE], config.sessionSecret)
+
+    // The state cookie is single use, whatever the outcome.
+    res.clearCookie(STATE_COOKIE, { path: '/' })
 
     if (typeof req.query.error === 'string') {
       fail(res, 'github_denied')
       return
     }
-    if (!states.consume(state)) {
+    if (!expectedState || !stateMatches(providedState, expectedState)) {
       fail(res, 'invalid_state')
       return
     }
@@ -76,18 +97,10 @@ export function createAuthRouter(options: AuthRouterOptions): Router {
     try {
       const accessToken = await exchangeCodeForToken(config, code, fetchImpl)
       const user = await fetchGitHubUser(config, accessToken, fetchImpl)
-      const session = sessions.create(user)
-      res.cookie(
-        SESSION_COOKIE,
-        serializeSessionCookie(session.id, config.sessionSecret),
-        {
-          httpOnly: true,
-          sameSite: 'lax',
-          secure: config.cookieSecure,
-          path: '/',
-          maxAge: SESSION_TTL_MS,
-        },
-      )
+      res.cookie(SESSION_COOKIE, createSessionToken(user, config.sessionSecret), {
+        ...baseCookie,
+        maxAge: SESSION_TTL_MS,
+      })
       res.redirect('/')
     } catch (error) {
       console.error('GitHub sign in failed:', error)
@@ -109,10 +122,7 @@ export function createAuthRouter(options: AuthRouterOptions): Router {
     res.json({ user: session.user })
   })
 
-  router.post('/logout', (req, res) => {
-    const cookies = parseCookie(req.headers.cookie ?? '')
-    const id = parseSessionCookie(cookies[SESSION_COOKIE], config.sessionSecret)
-    if (id) sessions.destroy(id)
+  router.post('/logout', (_req, res) => {
     res.clearCookie(SESSION_COOKIE, { path: '/' })
     res.status(204).end()
   })

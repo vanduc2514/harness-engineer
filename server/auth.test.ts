@@ -5,7 +5,14 @@ import { afterEach, describe, expect, it } from 'vitest'
 import { createApp } from './app.ts'
 import { GITHUB_ENDPOINTS } from './config.ts'
 import type { AppConfig } from './config.ts'
-import { SESSION_COOKIE, SessionStore, StateStore } from './sessions.ts'
+import {
+  SESSION_COOKIE,
+  SESSION_TTL_MS,
+  STATE_COOKIE,
+  createSessionToken,
+  readSessionToken,
+} from './sessions.ts'
+import type { SessionUser } from '../shared/types.ts'
 
 const {
   authorizeUrl: GITHUB_AUTHORIZE_URL,
@@ -20,6 +27,13 @@ const githubProfile = {
   name: 'The Octocat',
   avatar_url: 'https://avatars.githubusercontent.com/u/1?v=4',
   html_url: 'https://github.com/octocat',
+}
+
+const sessionUser: SessionUser = {
+  login: 'octocat',
+  name: 'The Octocat',
+  avatarUrl: 'https://avatars.githubusercontent.com/u/1?v=4',
+  profileUrl: 'https://github.com/octocat',
 }
 
 const config: AppConfig = {
@@ -90,12 +104,7 @@ afterEach(async () => {
 })
 
 async function startServer(fetchImpl: typeof fetch) {
-  const app = createApp({
-    config,
-    sessions: new SessionStore(),
-    states: new StateStore(),
-    fetchImpl,
-  })
+  const app = createApp({ config, fetchImpl })
   const server = app.listen(0)
   openServers.push(server)
   await once(server, 'listening')
@@ -103,26 +112,40 @@ async function startServer(fetchImpl: typeof fetch) {
   return { baseUrl: `http://127.0.0.1:${port}` }
 }
 
-async function beginLogin(baseUrl: string): Promise<string> {
-  const response = await fetch(`${baseUrl}/api/auth/github`, { redirect: 'manual' })
-  expect(response.status).toBe(302)
-  const location = response.headers.get('location') ?? ''
-  const state = new URL(location).searchParams.get('state')
-  if (!state) throw new Error('authorize redirect did not carry a state')
-  return state
-}
-
-function sessionCookieFrom(response: Response): string {
+function cookieFrom(response: Response, name: string): string {
   const header = response.headers
     .getSetCookie()
-    .find((value) => value.startsWith(`${SESSION_COOKIE}=`))
-  if (!header) throw new Error('session cookie was not set')
-  const [cookiePair] = header.split(';')
-  return cookiePair
+    .find((value) => value.startsWith(`${name}=`))
+  if (!header) throw new Error(`${name} was not set`)
+  const [pair] = header.split(';')
+  return pair
+}
+
+/** Starts a sign in the way a browser would, returning the state and its cookie. */
+async function beginLogin(baseUrl: string) {
+  const response = await fetch(`${baseUrl}/api/auth/github`, { redirect: 'manual' })
+  expect(response.status).toBe(302)
+
+  const location = new URL(response.headers.get('location') ?? '')
+  const state = location.searchParams.get('state')
+  if (!state) throw new Error('authorize redirect did not carry a state')
+
+  return { location, state, stateCookie: cookieFrom(response, STATE_COOKIE) }
+}
+
+function callback(
+  baseUrl: string,
+  query: string,
+  cookie?: string,
+): Promise<Response> {
+  return fetch(`${baseUrl}/api/auth/github/callback?${query}`, {
+    redirect: 'manual',
+    headers: cookie ? { cookie } : {},
+  })
 }
 
 describe('GET /api/auth/github', () => {
-  it('sends the browser to GitHub with the callback and scope', async () => {
+  it('sends the browser to GitHub with the callback, scope and state', async () => {
     const { fetchImpl } = createGitHubStub()
     const { baseUrl } = await startServer(fetchImpl)
 
@@ -136,23 +159,41 @@ describe('GET /api/auth/github', () => {
     expect(location.searchParams.get('scope')).toBe('read:user')
     expect(location.searchParams.get('state')).toBeTruthy()
   })
+
+  it('stores the state in a short lived httpOnly cookie', async () => {
+    const { fetchImpl } = createGitHubStub()
+    const { baseUrl } = await startServer(fetchImpl)
+
+    const response = await fetch(`${baseUrl}/api/auth/github`, { redirect: 'manual' })
+    const setCookie = response.headers.getSetCookie().join(' ')
+
+    expect(setCookie).toContain(`${STATE_COOKIE}=`)
+    expect(setCookie).toContain('HttpOnly')
+    expect(setCookie).toContain('SameSite=Lax')
+  })
 })
 
 describe('GET /api/auth/github/callback', () => {
-  it('exchanges the code, sets an httpOnly session cookie, and reports the profile', async () => {
+  it('exchanges the code and sets a session cookie holding the profile', async () => {
     const { fetchImpl, calls } = createGitHubStub()
     const { baseUrl } = await startServer(fetchImpl)
-    const state = await beginLogin(baseUrl)
+    const { state, stateCookie } = await beginLogin(baseUrl)
 
-    const callback = await fetch(
-      `${baseUrl}/api/auth/github/callback?code=the-code&state=${state}`,
-      { redirect: 'manual' },
+    const response = await callback(
+      baseUrl,
+      `code=the-code&state=${state}`,
+      stateCookie,
     )
 
-    expect(callback.status).toBe(302)
-    expect(callback.headers.get('location')).toBe('/')
-    expect(callback.headers.getSetCookie().join(' ')).toContain('HttpOnly')
-    expect(callback.headers.getSetCookie().join(' ')).toContain('SameSite=Lax')
+    expect(response.status).toBe(302)
+    expect(response.headers.get('location')).toBe('/')
+
+    const setCookie = response.headers.getSetCookie()
+    expect(setCookie.some((value) => value.startsWith(`${SESSION_COOKIE}=`))).toBe(true)
+    expect(setCookie.join(' ')).toContain('HttpOnly')
+    expect(setCookie.join(' ')).toContain('SameSite=Lax')
+    // The state cookie is spent, whatever happened.
+    expect(setCookie.join(' ')).toContain(`${STATE_COOKIE}=;`)
 
     // The code is exchanged server side, with the secret, against GitHub.
     const tokenCall = calls.find((call) => call.url === GITHUB_TOKEN_URL)
@@ -165,9 +206,8 @@ describe('GET /api/auth/github/callback', () => {
       redirect_uri: config.callbackUrl,
     })
 
-    const me = await fetch(`${baseUrl}/api/auth/me`, {
-      headers: { cookie: sessionCookieFrom(callback) },
-    })
+    const session = cookieFrom(response, SESSION_COOKIE)
+    const me = await fetch(`${baseUrl}/api/auth/me`, { headers: { cookie: session } })
     const meBody = await me.text()
 
     expect(me.status).toBe(200)
@@ -183,32 +223,44 @@ describe('GET /api/auth/github/callback', () => {
     expect(meBody).not.toContain(ACCESS_TOKEN)
   })
 
-  it('refuses a replayed state', async () => {
+  it('refuses a state that does not match the cookie', async () => {
     const { fetchImpl } = createGitHubStub()
     const { baseUrl } = await startServer(fetchImpl)
-    const state = await beginLogin(baseUrl)
+    const { stateCookie } = await beginLogin(baseUrl)
 
-    const first = await fetch(
-      `${baseUrl}/api/auth/github/callback?code=the-code&state=${state}`,
-      { redirect: 'manual' },
-    )
-    const second = await fetch(
-      `${baseUrl}/api/auth/github/callback?code=the-code&state=${state}`,
-      { redirect: 'manual' },
+    const response = await callback(
+      baseUrl,
+      'code=the-code&state=forged',
+      stateCookie,
     )
 
-    expect(first.headers.get('location')).toBe('/')
-    expect(second.headers.get('location')).toBe('/?authError=invalid_state')
+    expect(response.headers.get('location')).toBe('/?authError=invalid_state')
   })
 
-  it('refuses a state it never issued', async () => {
+  it('refuses a state without its cookie', async () => {
+    const { fetchImpl } = createGitHubStub()
+    const { baseUrl } = await startServer(fetchImpl)
+    const { state } = await beginLogin(baseUrl)
+
+    const response = await callback(baseUrl, `code=the-code&state=${state}`)
+
+    expect(response.headers.get('location')).toBe('/?authError=invalid_state')
+  })
+
+  it('refuses a callback for a state it never issued', async () => {
     const { fetchImpl } = createGitHubStub()
     const { baseUrl } = await startServer(fetchImpl)
 
-    const response = await fetch(
-      `${baseUrl}/api/auth/github/callback?code=the-code&state=forged`,
-      { redirect: 'manual' },
-    )
+    const response = await callback(baseUrl, 'code=the-code&state=forged')
+
+    expect(response.headers.get('location')).toBe('/?authError=invalid_state')
+  })
+
+  it('refuses a callback with no state at all', async () => {
+    const { fetchImpl } = createGitHubStub()
+    const { baseUrl } = await startServer(fetchImpl)
+
+    const response = await callback(baseUrl, 'code=the-code')
 
     expect(response.headers.get('location')).toBe('/?authError=invalid_state')
   })
@@ -216,27 +268,42 @@ describe('GET /api/auth/github/callback', () => {
   it('reports a cancelled authorisation', async () => {
     const { fetchImpl } = createGitHubStub()
     const { baseUrl } = await startServer(fetchImpl)
+    const { stateCookie } = await beginLogin(baseUrl)
 
-    const response = await fetch(
-      `${baseUrl}/api/auth/github/callback?error=access_denied&error_description=denied`,
-      { redirect: 'manual' },
+    const response = await callback(
+      baseUrl,
+      'error=access_denied&error_description=denied',
+      stateCookie,
     )
 
     expect(response.headers.get('location')).toBe('/?authError=github_denied')
   })
 
+  it('reports a callback with no code', async () => {
+    const { fetchImpl } = createGitHubStub()
+    const { baseUrl } = await startServer(fetchImpl)
+    const { state, stateCookie } = await beginLogin(baseUrl)
+
+    const response = await callback(baseUrl, `state=${state}`, stateCookie)
+
+    expect(response.headers.get('location')).toBe('/?authError=missing_code')
+  })
+
   it('reports a failed code exchange', async () => {
     const { fetchImpl } = createGitHubStub({ tokenStatus: 500 })
     const { baseUrl } = await startServer(fetchImpl)
-    const state = await beginLogin(baseUrl)
+    const { state, stateCookie } = await beginLogin(baseUrl)
 
-    const response = await fetch(
-      `${baseUrl}/api/auth/github/callback?code=the-code&state=${state}`,
-      { redirect: 'manual' },
+    const response = await callback(
+      baseUrl,
+      `code=the-code&state=${state}`,
+      stateCookie,
     )
 
     expect(response.headers.get('location')).toBe('/?authError=token_exchange_failed')
-    expect(response.headers.getSetCookie()).toEqual([])
+    expect(
+      response.headers.getSetCookie().some((value) => value.startsWith(SESSION_COOKIE)),
+    ).toBe(false)
   })
 
   it('reports a token response without an access token', async () => {
@@ -244,11 +311,12 @@ describe('GET /api/auth/github/callback', () => {
       tokenPayload: { error: 'bad_verification_code' },
     })
     const { baseUrl } = await startServer(fetchImpl)
-    const state = await beginLogin(baseUrl)
+    const { state, stateCookie } = await beginLogin(baseUrl)
 
-    const response = await fetch(
-      `${baseUrl}/api/auth/github/callback?code=the-code&state=${state}`,
-      { redirect: 'manual' },
+    const response = await callback(
+      baseUrl,
+      `code=the-code&state=${state}`,
+      stateCookie,
     )
 
     expect(response.headers.get('location')).toBe('/?authError=token_exchange_failed')
@@ -257,11 +325,12 @@ describe('GET /api/auth/github/callback', () => {
   it('reports a failed profile lookup', async () => {
     const { fetchImpl } = createGitHubStub({ userStatus: 403 })
     const { baseUrl } = await startServer(fetchImpl)
-    const state = await beginLogin(baseUrl)
+    const { state, stateCookie } = await beginLogin(baseUrl)
 
-    const response = await fetch(
-      `${baseUrl}/api/auth/github/callback?code=the-code&state=${state}`,
-      { redirect: 'manual' },
+    const response = await callback(
+      baseUrl,
+      `code=the-code&state=${state}`,
+      stateCookie,
     )
 
     expect(response.headers.get('location')).toBe('/?authError=profile_fetch_failed')
@@ -289,28 +358,60 @@ describe('GET /api/auth/me', () => {
 
     expect(response.status).toBe(401)
   })
+
+  it('rejects a session signed with another secret', async () => {
+    const { fetchImpl } = createGitHubStub()
+    const { baseUrl } = await startServer(fetchImpl)
+    const foreign = createSessionToken(sessionUser, 'another-secret')
+
+    const response = await fetch(`${baseUrl}/api/auth/me`, {
+      headers: { cookie: `${SESSION_COOKIE}=${foreign}` },
+    })
+
+    expect(response.status).toBe(401)
+  })
+
+  it('rejects an expired session', async () => {
+    const { fetchImpl } = createGitHubStub()
+    const { baseUrl } = await startServer(fetchImpl)
+    const stale = createSessionToken(
+      sessionUser,
+      config.sessionSecret,
+      Date.now() - SESSION_TTL_MS - 1,
+    )
+
+    expect(readSessionToken(stale, config.sessionSecret)).toBeNull()
+    const response = await fetch(`${baseUrl}/api/auth/me`, {
+      headers: { cookie: `${SESSION_COOKIE}=${stale}` },
+    })
+
+    expect(response.status).toBe(401)
+  })
 })
 
 describe('POST /api/auth/logout', () => {
-  it('drops the session and clears the cookie', async () => {
+  it('clears the session cookie', async () => {
     const { fetchImpl } = createGitHubStub()
     const { baseUrl } = await startServer(fetchImpl)
-    const state = await beginLogin(baseUrl)
-    const callback = await fetch(
-      `${baseUrl}/api/auth/github/callback?code=the-code&state=${state}`,
-      { redirect: 'manual' },
+    const { state, stateCookie } = await beginLogin(baseUrl)
+    const signedIn = await callback(
+      baseUrl,
+      `code=the-code&state=${state}`,
+      stateCookie,
     )
-    const cookie = sessionCookieFrom(callback)
+    const session = cookieFrom(signedIn, SESSION_COOKIE)
 
-    const logout = await fetch(`${baseUrl}/api/auth/logout`, {
+    const response = await fetch(`${baseUrl}/api/auth/logout`, {
       method: 'POST',
-      headers: { cookie },
+      headers: { cookie: session },
     })
 
-    expect(logout.status).toBe(204)
-    expect(logout.headers.getSetCookie().join(' ')).toContain(`${SESSION_COOKIE}=;`)
+    expect(response.status).toBe(204)
+    expect(response.headers.getSetCookie().join(' ')).toContain(`${SESSION_COOKIE}=;`)
 
-    const me = await fetch(`${baseUrl}/api/auth/me`, { headers: { cookie } })
+    // A browser that honours the clear cookie is signed out. The token itself
+    // stays valid until it expires, which is the price of a stateless session.
+    const me = await fetch(`${baseUrl}/api/auth/me`)
     expect(me.status).toBe(401)
   })
 })

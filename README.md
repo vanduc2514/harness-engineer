@@ -18,22 +18,28 @@ external dependency (OAuth, secrets, sessions) rather than a self-contained prot
 
 How the sign-in works:
 
-1. The browser hits `GET /api/auth/github`, which redirects to GitHub with a single-use
-   `state` value and `scope=read:user`.
+1. The browser hits `GET /api/auth/github`, which redirects to GitHub with a `state`
+   value and `scope=read:user`. The same `state` is stored in a short lived httpOnly
+   cookie, so the callback can tell that this browser started the flow.
 2. GitHub sends the browser back to `/api/auth/github/callback` with a code.
 3. The API exchanges that code for an access token, fetches the profile, then discards
    the token and sets an httpOnly session cookie.
 4. The frontend renders avatar, name and username from `GET /api/auth/me`.
 
-Sessions live in memory, so restarting the API signs everyone out. The GitHub access
-token is never stored on the server and never sent to the browser; a session lost to a
-restart costs the user one extra click.
+Sessions are stateless: the cookie is the session, signed with `SESSION_SECRET`, and
+nothing is stored on the server. Any instance can answer any request, which is what lets
+the same code run under `npm start` and as a Vercel function. The trade-off is that a
+copied cookie stays valid until it expires, because signing out can clear it in the
+browser but cannot revoke the value. The GitHub access token is never stored and never
+sent to the browser.
 
 ### Setup
 
 1. Create an OAuth App at <https://github.com/settings/applications/new> with:
    - Homepage URL `http://localhost:5173`
    - Authorization callback URL `http://localhost:5173/api/auth/github/callback`
+
+   Add the deployed callback URL as well once you have it (see Deployment).
 2. `cp .env.example .env`, then fill in `GITHUB_CLIENT_ID` and `GITHUB_CLIENT_SECRET`
    from that OAuth App and set `SESSION_SECRET` to `openssl rand -hex 32`.
 3. `mise install && mise run install`
@@ -64,6 +70,51 @@ possible without a human clicking "Authorize"; the stub is wired in through
 Signing in against real GitHub still needs one manual click, because consent is the
 whole point of the flow.
 
+## Deployment
+
+Two hosts, because the two parts have different needs.
+
+| Part | Host | Why |
+| --- | --- | --- |
+| Todo list demo | GitHub Pages | Pure static React, nothing to run |
+| Root app sign-in | Vercel | The code exchange needs a server to hold the client secret |
+
+### Todo list demo on GitHub Pages
+
+`.github/workflows/pages.yml` installs, tests and builds
+`experiments/react-todo-list` with `VITE_BASE=/<repo>/`, then publishes it, so the demo
+lands at `https://<user>.github.io/<repo>/`. Pages has to be switched to the workflow
+source once:
+
+```sh
+gh api -X POST repos/<user>/<repo>/pages -f build_type=workflow
+```
+
+The `VITE_BASE` input exists because a project page is served from a subdirectory; the
+build rewrites asset URLs to `/<repo>/assets/...` accordingly.
+
+### Root app on Vercel
+
+`api/[...route].ts` exports the same Express app that `npm start` runs, and
+`vercel.json` tells Vercel to build the Vite frontend into `dist`. Configuration comes
+from project environment variables, not from `.env`:
+
+| Variable | Value |
+| --- | --- |
+| `GITHUB_CLIENT_ID` | from the GitHub App |
+| `GITHUB_CLIENT_SECRET` | from the GitHub App |
+| `SESSION_SECRET` | `openssl rand -hex 32` |
+| `APP_ORIGIN` | `https://<project>.vercel.app` |
+| `COOKIE_SECURE` | `true` |
+
+`APP_ORIGIN` is what the API derives its callback URL from, so it must be the deployed
+origin. That URL then has to be registered on the GitHub App as well, otherwise GitHub
+refuses the exchange with `redirect_uri_mismatch`:
+
+```text
+https://<project>.vercel.app/api/auth/github/callback
+```
+
 ## Tooling
 
 GitHub Copilot CLI plugins extend the harness with skills, agents, hooks, MCP servers,
@@ -89,6 +140,7 @@ Skills install to `~/.copilot/installed-plugins/<marketplace>/<plugin>/skills/`.
 | --- | --- |
 | `src/` | Root app frontend: login screen and signed-in profile |
 | `server/` | Root app API: Express routes, OAuth flow, sessions, tests |
+| `api/` | Vercel entry that exports the same Express app |
 | `e2e/` | Browser test that drives the sign-in flow against a stub GitHub |
 | `shared/` | Types shared by the API and the browser |
 | `notes/` | Findings, harness evaluations, decisions |

@@ -4,12 +4,9 @@ import express from 'express'
 import type { Express } from 'express'
 import { createAuthRouter } from './auth.ts'
 import type { AppConfig } from './config.ts'
-import { SessionStore, StateStore } from './sessions.ts'
 
 export interface AppDeps {
   config: AppConfig
-  sessions?: SessionStore
-  states?: StateStore
   /** Swap out `fetch` in tests so no real GitHub call is made. */
   fetchImpl?: typeof fetch
   /** Built frontend directory. Served when it exists, so `npm start` can run alone. */
@@ -17,9 +14,6 @@ export interface AppDeps {
 }
 
 export function createApp(deps: AppDeps): Express {
-  const sessions = deps.sessions ?? new SessionStore()
-  const states = deps.states ?? new StateStore()
-
   const app = express()
   app.disable('x-powered-by')
   app.use((_req, res, next) => {
@@ -34,12 +28,7 @@ export function createApp(deps: AppDeps): Express {
 
   app.use(
     '/api/auth',
-    createAuthRouter({
-      config: deps.config,
-      sessions,
-      states,
-      fetchImpl: deps.fetchImpl,
-    }),
+    createAuthRouter({ config: deps.config, fetchImpl: deps.fetchImpl }),
   )
 
   // Anything else under /api is a miss, never the SPA fallback.

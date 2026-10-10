@@ -3,7 +3,6 @@ import { fileURLToPath } from 'node:url'
 import { createApp } from './app.ts'
 import { ConfigError, envFilePath, loadConfig, loadEnvFile } from './config.ts'
 import type { AppConfig } from './config.ts'
-import { SessionStore, StateStore } from './sessions.ts'
 
 const projectRoot = join(dirname(fileURLToPath(import.meta.url)), '..')
 loadEnvFile(envFilePath(projectRoot))
@@ -27,23 +26,9 @@ function main() {
     return
   }
 
-  const sessions = new SessionStore()
-  const states = new StateStore()
-  const app = createApp({
-    config,
-    sessions,
-    states,
-    distDir: join(projectRoot, 'dist'),
-  })
-
-  const pruneTimer = setInterval(
-    () => {
-      sessions.prune()
-      states.prune()
-    },
-    15 * 60 * 1000,
-  )
-  pruneTimer.unref()
+  // Sessions and OAuth state live in signed cookies, so there is nothing to
+  // prune and nothing to lose when the process restarts.
+  const app = createApp({ config, distDir: join(projectRoot, 'dist') })
 
   const server = app.listen(config.port, () => {
     console.log(`API listening on http://localhost:${config.port}`)

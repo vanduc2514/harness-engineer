@@ -1,9 +1,13 @@
+import { createHmac } from 'node:crypto'
 import { describe, expect, it } from 'vitest'
 import {
-  SessionStore,
-  StateStore,
-  parseSessionCookie,
-  serializeSessionCookie,
+  SESSION_TTL_MS,
+  STATE_TTL_MS,
+  createSessionToken,
+  createState,
+  readSessionToken,
+  readState,
+  stateMatches,
 } from './sessions.ts'
 import type { SessionUser } from '../shared/types.ts'
 
@@ -16,109 +20,84 @@ const user: SessionUser = {
 
 const SECRET = 'test-secret'
 
-describe('SessionStore', () => {
-  it('creates a session that can be read back', () => {
-    const sessions = new SessionStore()
-    const session = sessions.create(user)
+describe('session token', () => {
+  it('round-trips the user and the expiry', () => {
+    const token = createSessionToken(user, SECRET, 1_000)
 
-    expect(sessions.get(session.id)?.user).toEqual(user)
-    expect(session.expiresAt).toBeGreaterThan(session.createdAt)
+    expect(readSessionToken(token, SECRET, 1_500)).toEqual({
+      user,
+      expiresAt: 1_000 + SESSION_TTL_MS,
+    })
   })
 
-  it('treats an expired session as signed out and drops it', () => {
-    let now = 1_000
-    const sessions = new SessionStore({ ttlMs: 500, now: () => now })
-    const session = sessions.create(user)
+  it('expires exactly at its expiry time', () => {
+    const token = createSessionToken(user, SECRET, 1_000)
 
-    now = 1_499
-    expect(sessions.get(session.id)).not.toBeNull()
-
-    now = 1_500
-    expect(sessions.get(session.id)).toBeNull()
-    expect(sessions.size).toBe(0)
+    expect(readSessionToken(token, SECRET, 1_000 + SESSION_TTL_MS - 1)).not.toBeNull()
+    expect(readSessionToken(token, SECRET, 1_000 + SESSION_TTL_MS)).toBeNull()
   })
 
-  it('forgets a destroyed session', () => {
-    const sessions = new SessionStore()
-    const session = sessions.create(user)
+  it('rejects a token signed with another secret', () => {
+    const token = createSessionToken(user, SECRET, 1_000)
 
-    sessions.destroy(session.id)
-
-    expect(sessions.get(session.id)).toBeNull()
+    expect(readSessionToken(token, 'other-secret', 1_500)).toBeNull()
   })
 
-  it('prunes only expired sessions', () => {
-    let now = 0
-    const sessions = new SessionStore({ ttlMs: 100, now: () => now })
-    const first = sessions.create(user)
-    now = 60
-    const second = sessions.create(user)
+  it('rejects a swapped payload', () => {
+    const token = createSessionToken(user, SECRET, 1_000)
+    const signature = token.slice(token.lastIndexOf('.') + 1)
+    const forged = Buffer.from(
+      JSON.stringify({ user: { ...user, login: 'attacker' }, expiresAt: 9e15 }),
+    ).toString('base64url')
 
-    now = 120
-    expect(sessions.prune()).toBe(1)
-    expect(sessions.get(first.id)).toBeNull()
-    expect(sessions.get(second.id)).not.toBeNull()
-  })
-})
-
-describe('session cookie signing', () => {
-  it('round-trips a signed id', () => {
-    const value = serializeSessionCookie('session-id', SECRET)
-    expect(parseSessionCookie(value, SECRET)).toBe('session-id')
+    expect(readSessionToken(`${forged}.${signature}`, SECRET, 1_500)).toBeNull()
   })
 
-  it('rejects a tampered id', () => {
-    const value = serializeSessionCookie('session-id', SECRET)
-    const tampered = value.replace('session-id', 'session-XX')
-    expect(parseSessionCookie(tampered, SECRET)).toBeNull()
+  it('rejects a correctly signed payload that is not JSON', () => {
+    const payload = Buffer.from('not-json').toString('base64url')
+    const signature = createHmac('sha256', SECRET).update(payload).digest('base64url')
+
+    expect(readSessionToken(`${payload}.${signature}`, SECRET, 0)).toBeNull()
   })
 
-  it('rejects a value signed with another secret', () => {
-    const value = serializeSessionCookie('session-id', SECRET)
-    expect(parseSessionCookie(value, 'other-secret')).toBeNull()
-  })
-
-  it('rejects unsigned and malformed values', () => {
-    expect(parseSessionCookie(undefined, SECRET)).toBeNull()
-    expect(parseSessionCookie('', SECRET)).toBeNull()
-    expect(parseSessionCookie('session-id', SECRET)).toBeNull()
-    expect(parseSessionCookie('.signature', SECRET)).toBeNull()
+  it('rejects missing and malformed values', () => {
+    expect(readSessionToken(undefined, SECRET)).toBeNull()
+    expect(readSessionToken('', SECRET)).toBeNull()
+    expect(readSessionToken('no-separator', SECRET)).toBeNull()
+    expect(readSessionToken('.signature-only', SECRET)).toBeNull()
   })
 })
 
-describe('StateStore', () => {
-  it('issues unique values and accepts each one only once', () => {
-    const states = new StateStore()
-    const state = states.issue()
+describe('oauth state', () => {
+  it('round-trips the state through its cookie token', () => {
+    const { state, token } = createState(SECRET, 1_000)
 
-    expect(state).not.toBe(states.issue())
-    expect(states.consume(state)).toBe(true)
-    expect(states.consume(state)).toBe(false)
-    expect(states.consume(undefined)).toBe(false)
-    expect(states.consume('never-issued')).toBe(false)
+    expect(state).toHaveLength(32)
+    expect(readState(token, SECRET, 1_500)).toBe(state)
   })
 
-  it('refuses an expired value and forgets it', () => {
-    let now = 0
-    const states = new StateStore({ ttlMs: 100, now: () => now })
-    const state = states.issue()
+  it('expires exactly at its expiry time', () => {
+    const { token } = createState(SECRET, 1_000)
 
-    now = 101
-    expect(states.consume(state)).toBe(false)
-    expect(states.size).toBe(0)
+    expect(readState(token, SECRET, 1_000 + STATE_TTL_MS - 1)).not.toBeNull()
+    expect(readState(token, SECRET, 1_000 + STATE_TTL_MS)).toBeNull()
   })
 
-  it('prunes expired values that were never consumed', () => {
-    let now = 0
-    const states = new StateStore({ ttlMs: 100, now: () => now })
-    const stale = states.issue()
-    now = 60
-    const live = states.issue()
+  it('issues a fresh state every time', () => {
+    expect(createState(SECRET).state).not.toBe(createState(SECRET).state)
+  })
 
-    now = 101
-    expect(states.prune()).toBe(1)
-    expect(states.size).toBe(1)
-    expect(states.consume(stale)).toBe(false)
-    expect(states.consume(live)).toBe(true)
+  it('rejects a token signed with another secret', () => {
+    const { token } = createState(SECRET, 1_000)
+
+    expect(readState(token, 'other-secret', 1_500)).toBeNull()
+    expect(readState(undefined, SECRET, 1_500)).toBeNull()
+  })
+
+  it('matches only an identical state', () => {
+    expect(stateMatches('abc', 'abc')).toBe(true)
+    expect(stateMatches('abc', 'abd')).toBe(false)
+    expect(stateMatches('abc', 'abcd')).toBe(false)
+    expect(stateMatches(undefined, 'abc')).toBe(false)
   })
 })
